@@ -1,10 +1,3 @@
-use std::env::args;
-use std::mem::{self, transmute};
-use std::os::fd::AsRawFd;
-use std::ptr;
-use std::{error::Error, io::ErrorKind, mem::MaybeUninit, sync::Arc, time::Duration};
-
-use csv::StringRecord;
 use pnet::packet::{
     icmp::{
         echo_reply::EchoReplyPacket, echo_request::MutableEchoRequestPacket, IcmpCode, IcmpPacket,
@@ -13,10 +6,21 @@ use pnet::packet::{
     ipv4::Ipv4Packet,
     Packet,
 };
-
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::net::Ipv4Addr;
-use tokio::task::JoinSet;
+use std::{
+    env::args,
+    error::Error,
+    io::ErrorKind,
+    mem::{self, transmute, MaybeUninit},
+    net::Ipv4Addr,
+    os::fd::AsRawFd,
+    ptr,
+    sync::Arc,
+    time::Duration,
+};
+
+const PACKET_SIZE: usize =
+    EchoReplyPacket::minimum_packet_size() + Ipv4Packet::minimum_packet_size();
 
 #[derive(serde::Deserialize)]
 struct InputAddr {
@@ -27,14 +31,87 @@ struct InputAddr {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // parse the input into each value
     let target = get_first_arg()?;
-    let record = StringRecord::from(target.split(',').collect::<Vec<_>>());
+    let record = csv::StringRecord::from(target.split(',').collect::<Vec<_>>());
     let input: InputAddr = record.deserialize(None)?;
 
+    // create the socket to be passed around
     let socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
-    let socket = Arc::new(socket);
 
     // create the "sockaddr"
+    let address = create_sock_address(&socket);
+
+    // set the ip address for the socket to send and recv from
+    let mut address = address.as_socket_ipv4().unwrap();
+    address.set_ip(input.address);
+    let address: SockAddr = address.into();
+
+    // put the socket and address into Arc<> for thread sharing
+    let socket = Arc::new(socket);
+    let address = Arc::new(address);
+
+    // create a set for the tasks to be collected into
+    let mut set = tokio::task::JoinSet::new();
+
+    for i in 0..input.count {
+        let inner_socket = Arc::clone(&socket);
+        let inner_address = Arc::clone(&address);
+        set.spawn(async move {
+            // create a buffer for the data to be carried in while sending
+            let mut buf: [u8; MutableEchoRequestPacket::minimum_packet_size()] =
+                [0; MutableEchoRequestPacket::minimum_packet_size()];
+            // create a packet to be sent
+            let packet =
+                create_icmp_request_packet(&mut buf, i as u16, 1234).consume_to_immutable();
+
+            let now = tokio::time::Instant::now();
+
+            let _sent = inner_socket.send_to(packet.packet(), &Arc::clone(&inner_address));
+
+            // create the buffer to take in the response data
+            let mut buf = [MaybeUninit::new(0); PACKET_SIZE];
+            let (_size, address_reply) = read_socket(&inner_socket, &mut buf).await;
+
+            let buf = extract_data(&mut buf);
+
+            // ignore the first 20 bytes, they are the ipv4 things.
+            // the last 8 bytes are the actual ICMP data
+            let _out_packet = EchoReplyPacket::new(&buf[20..]).unwrap();
+
+            let later = now.elapsed().as_micros();
+
+            println!(
+                "{},{},{}",
+                address_reply.as_socket().unwrap().ip(),
+                i,
+                later
+            );
+        });
+
+        // sleep for the interval provided via stdin
+        tokio::time::sleep(Duration::from_millis(input.interval as u64)).await;
+    }
+
+    // let mut n = 1;
+    // join all the tasks
+    while let Some(_res) = set.join_next().await {
+        // println!("{n} Finished!");
+        // n += 1;
+    }
+    Ok(())
+}
+
+fn get_first_arg() -> Result<String, Box<dyn Error>> {
+    match args().nth(1) {
+        None => Err(From::from("Expected an argument. None given.")),
+        Some(a) => Ok(a),
+    }
+}
+
+fn create_sock_address(socket: &Socket) -> SockAddr {
+    // ICMP doesn't have a port and SockAddr requires it.
+    // This allows the creation of SockAddr that has no port
     let mut addr_storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
     let mut len = mem::size_of_val(&addr_storage) as libc::socklen_t;
 
@@ -51,69 +128,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let address = unsafe { SockAddr::new(addr_storage, len) };
-
-    let mut address = address.as_socket_ipv4().unwrap();
-    address.set_ip(input.address);
-    let address: SockAddr = address.into();
-    let address = Arc::new(address);
-    let mut set = JoinSet::new();
-
-    for i in 0..input.count {
-        let inner_socket = Arc::clone(&socket);
-        let inner_address = Arc::clone(&address);
-        set.spawn(async move {
-            let mut buf: [u8; MutableEchoRequestPacket::minimum_packet_size()] =
-                [0; MutableEchoRequestPacket::minimum_packet_size()];
-            let packet =
-                create_icmp_request_packet(&mut buf, i as u16, 1234).consume_to_immutable();
-            let now = tokio::time::Instant::now();
-            let _sent = inner_socket.send_to(packet.packet(), &Arc::clone(&inner_address));
-            let mut buf = [MaybeUninit::new(0);
-                EchoReplyPacket::minimum_packet_size() + Ipv4Packet::minimum_packet_size()];
-            let (_size, address_reply) = read_socket(&inner_socket, &mut buf).await;
-
-            let buf = unsafe {
-                #[allow(invalid_value)]
-                let mut res: [u8; EchoReplyPacket::minimum_packet_size()
-                    + Ipv4Packet::minimum_packet_size()] = MaybeUninit::uninit().assume_init();
-
-                for i in
-                    0..EchoReplyPacket::minimum_packet_size() + Ipv4Packet::minimum_packet_size()
-                {
-                    let inner_value = ptr::read(buf[i].as_ptr());
-
-                    res[i] = transmute::<u8, u8>(inner_value);
-                }
-
-                res
-            };
-
-            let _out_packet = EchoReplyPacket::new(&buf[20..]).unwrap();
-            let later = now.elapsed().as_micros();
-            println!(
-                "{},{},{}",
-                address_reply.as_socket().unwrap().ip(),
-                i,
-                later
-            );
-
-            println!("Run Completed\n");
-        });
-        tokio::time::sleep(Duration::from_millis(input.interval as u64)).await;
-    }
-
-    let mut n = 1;
-    while let Some(_res) = set.join_next().await {
-        println!("{n} Finished!");
-        n += 1;
-    }
-    Ok(())
+    address
 }
 
-fn get_first_arg() -> Result<String, Box<dyn Error>> {
-    match args().nth(1) {
-        None => Err(From::from("Expected an argument. None given.")),
-        Some(a) => Ok(a),
+fn extract_data(buf: &mut [MaybeUninit<u8>]) -> [u8; PACKET_SIZE] {
+    // converts the slice of MaybeUninit to a [u8] that can be parsed
+    // as real bytes
+    unsafe {
+        #[allow(invalid_value)]
+        let mut res: [u8; PACKET_SIZE] = MaybeUninit::uninit().assume_init();
+
+        for i in 0..PACKET_SIZE {
+            let inner_value = ptr::read(buf[i].as_ptr());
+
+            res[i] = transmute::<u8, u8>(inner_value);
+        }
+
+        res
     }
 }
 
