@@ -1,3 +1,4 @@
+use libc::c_int;
 use pnet::packet::{
     icmp::{
         echo_reply::EchoReplyPacket, echo_request::MutableEchoRequestPacket, IcmpCode, IcmpPacket,
@@ -7,12 +8,13 @@ use pnet::packet::{
     Packet,
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use tokio::net::UdpSocket;
 use std::{
     env::args,
     error::Error,
     io::ErrorKind,
     mem::{self, transmute, MaybeUninit},
-    net::Ipv4Addr,
+    net::{Ipv4Addr, SocketAddrV4},
     os::fd::AsRawFd,
     ptr,
     sync::Arc,
@@ -38,6 +40,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // create the socket to be passed around
     let socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))?;
+    
+    let socket = UdpSocket::bind((input.address, 0)).await?;
 
     // create the "sockaddr"
     let address = create_sock_address(&socket);
@@ -67,19 +71,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             let now = tokio::time::Instant::now();
 
-            let _sent = inner_socket.send_to(packet.packet(), &Arc::clone(&inner_address));
+            //let _sent = inner_socket.send_to(packet.packet(), &Arc::clone(&inner_address).into::<SocketAddrV4>());
+            let bound = Arc::clone(&inner_address).as_socket_ipv4().unwrap();
+            let _sent = inner_socket.send_to(packet.packet(), bound);
 
             // create the buffer to take in the response data
             let mut buf = [MaybeUninit::new(0); PACKET_SIZE];
-            let (_size, address_reply) = read_socket(&inner_socket, &mut buf).await;
+            //let (_size, address_reply) = read_socket(&inner_socket, &mut buf).await;
+            let fut = read_socket(&inner_socket, &mut buf);
+            //            let fut = async {
+            //                tokio::time::sleep(Duration::from_secs_f64(1.0)).await;
+            //                (0usize, inner_address)
+            //            };
+
+            let (_size, address_reply) =
+                match tokio::time::timeout(tokio::time::Duration::from_secs(1), fut).await {
+                    Ok(a) => {
+                        println!("Working");
+                        a
+                    }
+                    Err(time) => {
+                        println!("Error scheduling the timeout: {}", time);
+                        return;
+                    }
+                };
+
+            let later = now.elapsed().as_micros();
 
             let buf = extract_data(&mut buf);
 
             // ignore the first 20 bytes, they are the ipv4 things.
             // the last 8 bytes are the actual ICMP data
             let _out_packet = EchoReplyPacket::new(&buf[20..]).unwrap();
-
-            let later = now.elapsed().as_micros();
 
             println!(
                 "{},{},{}",
@@ -109,7 +132,7 @@ fn get_first_arg() -> Result<String, Box<dyn Error>> {
     }
 }
 
-fn create_sock_address(socket: &Socket) -> SockAddr {
+fn create_sock_address(socket: &UdpSocket) -> SockAddr {
     // ICMP doesn't have a port and SockAddr requires it.
     // This allows the creation of SockAddr that has no port
     let mut addr_storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
@@ -169,9 +192,10 @@ fn create_icmp_request_packet(
 }
 
 // If you decide to go with the bonus you could just do sock.recv_from(buf).await
-async fn read_socket(sock: &Arc<Socket>, buf: &mut [MaybeUninit<u8>]) -> (usize, SockAddr) {
+async fn read_socket(sock: &Arc<UdpSocket>, buf: &mut [MaybeUninit<u8>]) -> (usize, SockAddr) {
     loop {
-        match sock.recv_from(buf) {
+        let mut buf = extract_data(buf);
+        match sock.recv_from(&mut buf).await {
             Err(e) => {
                 if e.kind() == ErrorKind::WouldBlock {
                     tokio::time::sleep(Duration::from_millis(1)).await;
@@ -179,17 +203,19 @@ async fn read_socket(sock: &Arc<Socket>, buf: &mut [MaybeUninit<u8>]) -> (usize,
                     panic!("Something went wrong while reading the socket");
                 }
             }
-            Ok(res) => return res,
+            Ok((len, addr)) => {
+                println!("inside!");
+                return (len, addr.into());
+            }
         }
     }
 }
 
-#[allow(dead_code)]
 // This function is just here to show you the size of the buffer you need to read ECHO replies.
-async fn read_socket_to_buf(
-    sock: &Arc<Socket>,
-    buf: &mut [MaybeUninit<u8>;
-             EchoReplyPacket::minimum_packet_size() + Ipv4Packet::minimum_packet_size()],
-) {
-    let (_res, _addr) = read_socket(&sock, buf).await;
-}
+// async fn read_socket_to_buf(
+//     sock: &Arc<Socket>,
+//     buf: &mut [MaybeUninit<u8>;
+//              EchoReplyPacket::minimum_packet_size() + Ipv4Packet::minimum_packet_size()],
+// ) {
+//     let (_res, _addr) = read_socket(&sock, buf).await;
+// }
